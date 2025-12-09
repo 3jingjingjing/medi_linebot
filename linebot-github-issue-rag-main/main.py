@@ -94,56 +94,50 @@ def build_context_from_kb(user_query: str) -> str:
 
 # ========== MedGamma（MedGemma）與 Gemini API client ==========
 
-MEDGAMMA_ENDPOINT = os.getenv("MEDGAMMA_ENDPOINT")
-MEDGAMMA_API_KEY = os.getenv("MEDGAMMA_API_KEY")
-
-GEMINI_ENDPOINT = os.getenv("GEMINI_ENDPOINT")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+HF_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
+MEDGAMMA_MODEL_ID = os.getenv("MEDGAMMA_MODEL_ID", "google/med-gemma-2b-it")
 
 
 def call_medgamma(prompt: str) -> str:
     """
-    呼叫 MedGamma（或你部署的 MedGemma 醫學模型）API。
+    用 Hugging Face Inference API 呼叫 MedGemma / MedGamma 模型。
+    預設會打到：
+      https://api-inference.huggingface.co/models/{MEDGAMMA_MODEL_ID}
     """
-    if not MEDGAMMA_ENDPOINT:
-        raise RuntimeError("MEDGAMMA_ENDPOINT not set")
+    if not HF_API_KEY:
+        raise RuntimeError("HUGGINGFACE_API_KEY not set")
 
-    payload = {
-        "input": prompt,
-        # 這裡依你實際 MedGamma API 格式調整
-    }
-    headers = {"Content-Type": "application/json"}
-    if MEDGAMMA_API_KEY:
-        headers["Authorization"] = f"Bearer {MEDGAMMA_API_KEY}"
+    api_url = f"https://api-inference.huggingface.co/models/{MEDGAMMA_MODEL_ID}"
 
-    resp = httpx.post(MEDGAMMA_ENDPOINT, json=payload, headers=headers, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    # 這行要依照實際回傳格式調整
-    return data["output"]
-
-
-def call_gemini(prompt: str) -> str:
-    """
-    呼叫 Gemini（例如 Google Generative AI）的 API，做口語化解釋。
-    """
-    if not GEMINI_ENDPOINT:
-        raise RuntimeError("GEMINI_ENDPOINT not set")
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}]
-        # 若你是用 Google 官方 SDK / 其他 endpoint，這裡要配合修改
-    }
     headers = {
+        "Authorization": f"Bearer {HF_API_KEY}",
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {GEMINI_API_KEY}",
     }
 
-    resp = httpx.post(GEMINI_ENDPOINT, json=payload, headers=headers, timeout=60)
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": 512,
+            "temperature": 0.2,
+            "do_sample": True,
+        }
+    }
+
+    resp = httpx.post(api_url, headers=headers, json=payload, timeout=120)
     resp.raise_for_status()
     data = resp.json()
-    # 同樣依照實際回傳格式調整
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+    # Inference API 通常回傳 list[{"generated_text": "..."}]
+    if isinstance(data, list) and len(data) > 0:
+        text = data[0].get("generated_text", "")
+        # 很多模型會把 prompt 一起 echo 回來，這裡順手幫你去掉
+        if text.startswith(prompt):
+            text = text[len(prompt):].lstrip()
+        return text.strip()
+
+    # 如果格式不一樣，就先轉成字串丟回來方便 debug
+    return str(data)
+
 
 
 # ========== prompt 組裝邏輯 ==========
@@ -244,3 +238,4 @@ async def handle_callback(request: Request):
         )
 
     return "OK"
+
