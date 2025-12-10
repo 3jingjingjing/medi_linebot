@@ -34,7 +34,6 @@ else:
 
 app = FastAPI()
 
-# 設定首頁防止 404，讓 Render 健康檢查能通過
 @app.get("/")
 async def root():
     return {"message": "MedLineBot is running!"}
@@ -82,11 +81,9 @@ def build_context_from_kb(user_query: str) -> str:
         )
     return "\n\n".join(blocks)
 
-# ========== 模型連線區 (自動切換邏輯) ==========
+# ========== 模型連線區 ==========
 
-# 優先嘗試使用者指定的模型 (即使它可能失敗)
 PRIMARY_MODEL_ID = os.getenv("MEDGAMMA_MODEL_ID", "google/medgemma-27b-text-it")
-# 備用模型：Google Gemma 2 (9B)，目前最強的開源小模型，免費 API 支援度高
 FALLBACK_MODEL_ID = "google/gemma-2-9b-it"
 
 def call_huggingface_api(model_id: str, prompt: str) -> str:
@@ -104,10 +101,7 @@ def call_huggingface_api(model_id: str, prompt: str) -> str:
         }
     }
     
-    # 設定 timeout 為 60 秒
     resp = httpx.post(api_url, headers=headers, json=payload, timeout=60)
-    
-    # 如果是 410 (Gone) 或 404 等錯誤，這裡會引發異常，讓外層的 try-except 抓到
     resp.raise_for_status()
     
     data = resp.json()
@@ -117,32 +111,49 @@ def call_huggingface_api(model_id: str, prompt: str) -> str:
 
 def call_medgamma(prompt: str) -> str:
     """
-    【關鍵修正】自動切換機制
+    醫學模型切換邏輯
     """
-    print(f"正在嘗試呼叫主模型: {PRIMARY_MODEL_ID}")
+    print(f"嘗試呼叫主模型: {PRIMARY_MODEL_ID}")
     try:
-        # 嘗試連線主模型 (例如 MedGemma)
         return call_huggingface_api(PRIMARY_MODEL_ID, prompt)
     except Exception as e:
-        # 如果失敗 (例如 410 Gone)，印出錯誤並切換到備用模型
-        print(f"主模型連線失敗 (Error: {e})，正在切換至備用模型: {FALLBACK_MODEL_ID}...")
+        print(f"主模型失敗 ({e})，切換備用模型: {FALLBACK_MODEL_ID}")
         try:
             return call_huggingface_api(FALLBACK_MODEL_ID, prompt)
         except Exception as e2:
-            return f"醫學模型暫時無法使用，請檢查 API 設定。(Error: {str(e2)})"
+            return f"模型暫時無法使用: {str(e2)}"
 
 def call_gemini(prompt: str) -> str:
+    """
+    【關鍵修正】Gemini 多重備援機制
+    嘗試順序: 1.5 Flash -> 1.5 Pro -> Pro (1.0)
+    """
     if not GEMINI_API_KEY:
         return "錯誤：未設定 GEMINI_API_KEY"
-    try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(prompt)
-        return response.text.strip() if response.text else "無回應"
-    except Exception as e:
-        print(f"Gemini Error: {e}")
-        return "系統忙碌中"
+    
+    # 定義要嘗試的模型清單
+    candidate_models = [
+        "gemini-1.5-flash", 
+        "gemini-1.5-flash-latest", 
+        "gemini-1.5-pro", 
+        "gemini-pro"
+    ]
+    
+    for model_name in candidate_models:
+        try:
+            print(f"正在嘗試 Gemini 模型: {model_name}")
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt)
+            if response.text:
+                return response.text.strip()
+        except Exception as e:
+            # 只有當是 404 (Not Found) 時才繼續嘗試下一個，其他錯誤印出來
+            print(f"模型 {model_name} 失敗: {e}")
+            continue
+            
+    return "抱歉，目前所有 Gemini 模型都暫時無法連線，請稍後再試。"
 
-# ========== 核心邏輯：自動判斷 Prompt ==========
+# ========== 核心邏輯 ==========
 
 def build_med_prompt(user_query: str) -> str:
     context = build_context_from_kb(user_query)
@@ -176,13 +187,9 @@ def build_smart_synthesis_prompt(user_query: str, med_answer: str) -> str:
 """
 
 def answer_user_message_auto(user_query: str) -> str:
-    # 1. 先獲取硬核知識 (這裡會自動處理 410 錯誤)
     med_answer = call_medgamma(build_med_prompt(user_query))
-    
-    # 2. 讓 Gemini 進行智慧合成
     final_prompt = build_smart_synthesis_prompt(user_query, med_answer)
     final_answer = call_gemini(final_prompt)
-    
     return final_answer
 
 # ========== Webhook ==========
@@ -201,8 +208,6 @@ async def handle_callback(request: Request):
     for event in events:
         if isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
             user_text = event.message.text.strip()
-            
-            # 統一入口，不再需要 #專業 或 #口語
             answer = answer_user_message_auto(user_text)
 
             await line_bot_api.reply_message(
