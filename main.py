@@ -65,7 +65,7 @@ def match_gene_items(user_query: str):
     """
     超簡易版「RAG 檢索」：
     - 如果問題裡有提到某個基因名稱，就只選那些
-    - 如果完全沒 match，就先全部給（之後可以升級成向量資料庫）
+    - 如果完全沒 match，就先全部給
     """
     hits = []
     for item in GENE_KB:
@@ -147,16 +147,16 @@ def build_med_prompt(user_query: str) -> str:
     給 MedGamma 用的專業版 prompt：會帶入你的 Python 知識庫（RAG context）。
     """
     context = build_context_from_kb(user_query)
-    return f"""你是一位運動醫學與運動基因專家。
+    return f"""你是一位健身與運動基因專家。
 
-【運動基因與跑步相關知識庫】
+【健身基因與跑步相關知識庫】
 {context}
 
 【使用者問題】
 {user_query}
 
 請你根據上述知識庫內容，從醫學與運動生理角度分析：
-1. 說明該跑者在跑步／馬拉松訓練上的潛在優勢與風險。
+1. 說明該使用者在進行健身時的情況。
 2. 說明可能涉及的生理機轉（例如發炎反應、肌肉損傷、恢復速度等），但不要捏造沒有依據的內容。
 3. 提供清楚、具體的訓練與恢復建議。
 
@@ -174,7 +174,7 @@ def build_gemini_prompt(user_query: str, med_answer: str) -> str:
 {med_answer}
 
 請你把上面的內容重新整理成：
-1. 一般跑者也聽得懂的白話解釋。
+1. 一般人也聽得懂的白話解釋。
 2. 用條列方式列出 3~5 個重點。
 3. 給出具體、容易執行的訓練建議（例如配速、每週跑量、恢復時間、熱身與收操注意事項）。
 
@@ -238,5 +238,6 @@ async def handle_callback(request: Request):
         )
 
     return "OK"
+
 
 
