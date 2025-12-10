@@ -1,48 +1,50 @@
 # -*- coding: utf-8 -*-
 
-#  Licensed under the Apache License, Version 2.0 (the "License"); you may
-#  not use this file except in compliance with the License. You may obtain
-#  a copy of the License at
-#
-#       https://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
-#  WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
-#  License for the specific language governing permissions and limitations
-#  under the License.
-
 import os
 import sys
 import httpx
-
 import aiohttp
-from fastapi import FastAPI, Request, HTTPException
+import google.generativeai as genai
 
+from fastapi import FastAPI, Request, HTTPException
 from linebot import AsyncLineBotApi, WebhookParser
 from linebot.aiohttp_async_http_client import AiohttpAsyncHttpClient
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-# ========== LINE Bot 設定 ==========
+# ========== 環境變數檢查 ==========
 
 channel_secret = os.getenv("ChannelSecret", None)
 channel_access_token = os.getenv("ChannelAccessToken", None)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+HF_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
 
 if channel_secret is None:
-    print("Specify ChannelSecret as environment variable.")
+    print("Error: ChannelSecret not set.")
     sys.exit(1)
 if channel_access_token is None:
-    print("Specify ChannelAccessToken as environment variable.")
+    print("Error: ChannelAccessToken not set.")
     sys.exit(1)
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("Warning: GEMINI_API_KEY not set.")
+
+# ========== 初始化 APP ==========
 
 app = FastAPI()
+
+# 設定首頁防止 404，讓 Render 健康檢查能通過
+@app.get("/")
+async def root():
+    return {"message": "MedLineBot is running!"}
+
 session = aiohttp.ClientSession()
 async_http_client = AiohttpAsyncHttpClient(session)
 line_bot_api = AsyncLineBotApi(channel_access_token, async_http_client)
 parser = WebhookParser(channel_secret)
 
-# ========== 你的運動基因知識庫（Python 版 RAG 資料） ==========
+# ========== 知識庫 ==========
 
 GENE_KB = [
     {
@@ -57,16 +59,9 @@ GENE_KB = [
         "risk": "長距離訓練後疲勞堆積較明顯，如恢復不足，較易出現過度訓練狀態。",
         "advice": "適合穩定配速長跑，每週總跑量成長幅度宜保守，固定安排休息日與低強度日。"
     },
-    # TODO: 在這裡繼續補上你的其他基因與說明
 ]
 
-
 def match_gene_items(user_query: str):
-    """
-    超簡易版「RAG 檢索」：
-    - 如果問題裡有提到某個基因名稱，就只選那些
-    - 如果完全沒 match，就先全部給
-    """
     hits = []
     for item in GENE_KB:
         if item["gene"] in user_query:
@@ -75,11 +70,7 @@ def match_gene_items(user_query: str):
         hits = GENE_KB
     return hits
 
-
 def build_context_from_kb(user_query: str) -> str:
-    """
-    把上面 GENE_KB 裡挑出的條目，組成一段給 LLM 用的 context 字串。
-    """
     items = match_gene_items(user_query)
     blocks = []
     for it in items:
@@ -91,123 +82,114 @@ def build_context_from_kb(user_query: str) -> str:
         )
     return "\n\n".join(blocks)
 
+# ========== 模型連線區 (自動切換邏輯) ==========
 
-# ========== MedGamma（MedGemma）與 Gemini API client ==========
+# 優先嘗試使用者指定的模型 (即使它可能失敗)
+PRIMARY_MODEL_ID = os.getenv("MEDGAMMA_MODEL_ID", "google/medgemma-27b-text-it")
+# 備用模型：Google Gemma 2 (9B)，目前最強的開源小模型，免費 API 支援度高
+FALLBACK_MODEL_ID = "google/gemma-2-9b-it"
 
-HF_API_KEY = os.getenv("HUGGINGFACE_API_KEY")
-MEDGAMMA_MODEL_ID = os.getenv("MEDGAMMA_MODEL_ID", "google/med-gemma-2b-it")
-
-
-def call_medgamma(prompt: str) -> str:
-    """
-    用 Hugging Face Inference API 呼叫 MedGemma / MedGamma 模型。
-    預設會打到：
-      https://api-inference.huggingface.co/models/{MEDGAMMA_MODEL_ID}
-    """
+def call_huggingface_api(model_id: str, prompt: str) -> str:
     if not HF_API_KEY:
-        raise RuntimeError("HUGGINGFACE_API_KEY not set")
+        return "錯誤：未設定 HUGGINGFACE_API_KEY"
 
-    api_url = f"https://api-inference.huggingface.co/models/{MEDGAMMA_MODEL_ID}"
-
-    headers = {
-        "Authorization": f"Bearer {HF_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
+    api_url = f"https://api-inference.huggingface.co/models/{model_id}"
+    headers = {"Authorization": f"Bearer {HF_API_KEY}"}
     payload = {
         "inputs": prompt,
         "parameters": {
-            "max_new_tokens": 512,
-            "temperature": 0.2,
-            "do_sample": True,
+            "max_new_tokens": 600,
+            "temperature": 0.3,
+            "return_full_text": False
         }
     }
-
-    resp = httpx.post(api_url, headers=headers, json=payload, timeout=120)
+    
+    # 設定 timeout 為 60 秒
+    resp = httpx.post(api_url, headers=headers, json=payload, timeout=60)
+    
+    # 如果是 410 (Gone) 或 404 等錯誤，這裡會引發異常，讓外層的 try-except 抓到
     resp.raise_for_status()
+    
     data = resp.json()
-
-    # Inference API 通常回傳 list[{"generated_text": "..."}]
     if isinstance(data, list) and len(data) > 0:
-        text = data[0].get("generated_text", "")
-        # 很多模型會把 prompt 一起 echo 回來，這裡順手幫你去掉
-        if text.startswith(prompt):
-            text = text[len(prompt):].lstrip()
-        return text.strip()
-
-    # 如果格式不一樣，就先轉成字串丟回來方便 debug
+        return data[0].get("generated_text", "").strip()
     return str(data)
 
+def call_medgamma(prompt: str) -> str:
+    """
+    【關鍵修正】自動切換機制
+    """
+    print(f"正在嘗試呼叫主模型: {PRIMARY_MODEL_ID}")
+    try:
+        # 嘗試連線主模型 (例如 MedGemma)
+        return call_huggingface_api(PRIMARY_MODEL_ID, prompt)
+    except Exception as e:
+        # 如果失敗 (例如 410 Gone)，印出錯誤並切換到備用模型
+        print(f"主模型連線失敗 (Error: {e})，正在切換至備用模型: {FALLBACK_MODEL_ID}...")
+        try:
+            return call_huggingface_api(FALLBACK_MODEL_ID, prompt)
+        except Exception as e2:
+            return f"醫學模型暫時無法使用，請檢查 API 設定。(Error: {str(e2)})"
 
+def call_gemini(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        return "錯誤：未設定 GEMINI_API_KEY"
+    try:
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(prompt)
+        return response.text.strip() if response.text else "無回應"
+    except Exception as e:
+        print(f"Gemini Error: {e}")
+        return "系統忙碌中"
 
-# ========== prompt 組裝邏輯 ==========
+# ========== 核心邏輯：自動判斷 Prompt ==========
 
 def build_med_prompt(user_query: str) -> str:
-    """
-    給 MedGamma 用的專業版 prompt：會帶入你的 Python 知識庫（RAG context）。
-    """
     context = build_context_from_kb(user_query)
-    return f"""你是一位健身與運動基因專家。
-
-【健身基因與跑步相關知識庫】
+    return f"""你是一位運動醫學專家。
+資料庫：
 {context}
+
+使用者問題：{user_query}
+
+請根據資料庫，提供詳盡、專業的醫學與生理機制分析 (不需要口語化，請專注於專業與準確度)。
+"""
+
+def build_smart_synthesis_prompt(user_query: str, med_answer: str) -> str:
+    return f"""你是一位專業但善於溝通的運動教練。
+我們收到了一份來自醫學 AI 的專業分析報告，請你協助回覆使用者。
 
 【使用者問題】
 {user_query}
 
-請你根據上述知識庫內容，從醫學與運動生理角度分析：
-1. 說明該使用者在進行健身時的情況。
-2. 說明可能涉及的生理機轉（例如發炎反應、肌肉損傷、恢復速度等），但不要捏造沒有依據的內容。
-3. 提供清楚、具體的訓練與恢復建議。
-
-請用繁體中文回答，內容可以專業一點沒關係。
-"""
-
-
-def build_gemini_prompt(user_query: str, med_answer: str) -> str:
-    """
-    給 Gemini 的 prompt：請他把 MedGamma 的專業說明翻譯成跑者聽得懂的版本。
-    """
-    return f"""以下是針對一位跑者的運動基因與訓練風險，由醫學模型產生的專業說明：
-
-【專業說明】
+【醫學 AI 的專業分析】
 {med_answer}
 
-請你把上面的內容重新整理成：
-1. 一般人也聽得懂的白話解釋。
-2. 用條列方式列出 3~5 個重點。
-3. 給出具體、容易執行的訓練建議（例如配速、每週跑量、恢復時間、熱身與收操注意事項）。
+【你的任務】
+請綜合以上資訊回答使用者。
+**請根據使用者的問題語氣，自動決定回答風格：**
+1. 如果使用者問得很專業，請保持**專業、學術**的風格。
+2. 如果使用者問得很白話，請用**親切、易懂**的口語解釋。
 
-請用繁體中文回答，語氣友善但務實，像是在對跑者講話。
-使用者原本的問題是：「{user_query}」。
+無論哪種風格，都必須包含具體的訓練建議。
+請用繁體中文回答。
 """
 
-
-def answer_user_message(user_query: str, mode: str = "friendly") -> str:
-    """
-    整合 MedGamma + Gemini 的主流程。
-
-    mode:
-      - "pro"：只回 MedGamma 的專業版（適合你自己或教練看）
-      - "friendly"：MedGamma 做底，再交給 Gemini 口語化（給一般跑者）
-    """
-    med_prompt = build_med_prompt(user_query)
-    med_answer = call_medgamma(med_prompt)
-
-    if mode == "pro":
-        return med_answer
-
-    gemini_prompt = build_gemini_prompt(user_query, med_answer)
-    final_answer = call_gemini(gemini_prompt)
+def answer_user_message_auto(user_query: str) -> str:
+    # 1. 先獲取硬核知識 (這裡會自動處理 410 錯誤)
+    med_answer = call_medgamma(build_med_prompt(user_query))
+    
+    # 2. 讓 Gemini 進行智慧合成
+    final_prompt = build_smart_synthesis_prompt(user_query, med_answer)
+    final_answer = call_gemini(final_prompt)
+    
     return final_answer
 
-
-# ========== LINE Webhook ==========
+# ========== Webhook ==========
 
 @app.post("/callback")
 async def handle_callback(request: Request):
     signature = request.headers.get("X-Line-Signature")
-
     body = await request.body()
     body = body.decode("utf-8")
 
@@ -217,27 +199,15 @@ async def handle_callback(request: Request):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     for event in events:
-        if not isinstance(event, MessageEvent):
-            continue
-        if not isinstance(event.message, TextMessage):
-            continue
+        if isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
+            user_text = event.message.text.strip()
+            
+            # 統一入口，不再需要 #專業 或 #口語
+            answer = answer_user_message_auto(user_text)
 
-        user_text = event.message.text.strip()
-
-        # 若訊息前面加 #專業 ，就回純醫學版
-        if user_text.startswith("#專業"):
-            query = user_text.replace("#專業", "", 1).strip()
-            answer = answer_user_message(query, mode="pro")
-        else:
-            # 預設：一般跑者模式 → 口語化版本
-            answer = answer_user_message(user_text, mode="friendly")
-
-        await line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=answer[:2000])  # 避免超過 LINE 長度限制
-        )
+            await line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=answer[:2000])
+            )
 
     return "OK"
-
-
-
