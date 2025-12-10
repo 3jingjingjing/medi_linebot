@@ -10,5 +10,5 @@ langchain_core
 faiss-cpu
 langchain
 httpx
-aiohttp
+aiohttp>=3.9.0
 google-generativeai
