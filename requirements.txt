@@ -3,4 +3,4 @@ uvicorn
 line-bot-sdk>=3.0.0
 aiohttp>=3.9.0
 httpx
-google-generativeai>=0.7.2
+google-generativeai>=0.8.3
