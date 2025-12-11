@@ -60,7 +60,7 @@ def build_context_from_kb(user_query: str) -> str:
         blocks.append(f"基因：{it['gene']}\n特徵：{it['condition']}\n風險：{it['risk']}\n建議：{it['advice']}")
     return "\n\n".join(blocks)
 
-# ========== 核心：呼叫遠端模型 (ngrok) ==========
+# ========== 核心：呼叫遠端模型 (ngrok 防擋版) ==========
 
 async def call_remote_medgemma(user_query: str) -> str:
     if not REMOTE_API_BASE:
@@ -75,9 +75,11 @@ async def call_remote_medgemma(user_query: str) -> str:
 """
 
     # 2. 準備 Payload
+    # 【關鍵修改】加入 ngrok-skip-browser-warning Header
     headers = {
         "Authorization": f"Bearer {REMOTE_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "ngrok-skip-browser-warning": "69420"  # 這行是關鍵！讓 ngrok 知道這是 API 請求
     }
     
     payload = {
@@ -90,11 +92,11 @@ async def call_remote_medgemma(user_query: str) -> str:
         "temperature": 0.7
     }
 
-    # 3. 自動路徑偵測 (適應 vLLM 或其他 Server)
+    # 3. 自動路徑偵測
     clean_base = REMOTE_API_BASE.rstrip("/")
     candidate_urls = [
-        f"{clean_base}/v1/chat/completions",  # 標準 vLLM / OpenAI 格式
-        f"{clean_base}/chat/completions",     # 某些簡易 Server 格式
+        f"{clean_base}/v1/chat/completions",
+        f"{clean_base}/chat/completions", 
     ]
 
     async with httpx.AsyncClient() as client:
@@ -102,11 +104,16 @@ async def call_remote_medgemma(user_query: str) -> str:
         
         for url in candidate_urls:
             try:
-                # 設定長一點的 timeout (因為家用電腦網路可能比較慢)
+                # 設定長一點的 timeout
                 resp = await client.post(url, json=payload, headers=headers, timeout=120.0)
                 
+                # 如果是 HTML (通常是 ngrok 錯誤頁面)，視為失敗
+                if "text/html" in resp.headers.get("content-type", ""):
+                    last_error = "連線被 ngrok 警告頁面擋住了，或網址錯誤。"
+                    continue
+
                 if resp.status_code == 404:
-                    continue # 路徑不對，換下一個
+                    continue 
                 
                 if resp.status_code == 200:
                     data = resp.json()
@@ -115,17 +122,17 @@ async def call_remote_medgemma(user_query: str) -> str:
                 return f"遠端伺服器錯誤 ({resp.status_code}): {resp.text}"
 
             except httpx.ConnectError:
-                return "無法連線到 ngrok。請確認朋友電腦是否開著，且 ngrok 正在執行？"
+                return "無法連線到 ngrok。請確認網址是否正確？朋友電腦是否開著？"
             except Exception as e:
                 last_error = str(e)
 
-        return f"連線失敗。請確認 ngrok 網址是否正確。\n最後錯誤: {last_error}"
+        return f"連線失敗。\n最後錯誤: {last_error}"
 
 # ========== Webhook ==========
 
 @app.get("/")
 async def root():
-    return {"message": "MedLineBot connected via ngrok is running!"}
+    return {"message": "MedLineBot (ngrok version) is running!"}
 
 @app.post("/callback")
 async def handle_callback(request: Request):
