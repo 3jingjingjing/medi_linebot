@@ -10,18 +10,18 @@ from linebot.aiohttp_async_http_client import AiohttpAsyncHttpClient
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 
-# ========== 設定區 ==========
+# ========== 1. 環境變數檢查 ==========
 
 channel_secret = os.getenv("ChannelSecret", None)
 channel_access_token = os.getenv("ChannelAccessToken", None)
 
-# RunPod 設定 (從環境變數讀取)
-# 格式範例: https://abc-123-8000.proxy.runpod.net/v1
+# RunPod 設定
+# 這裡會讀取你在 Render 設定的網址
 RUNPOD_API_BASE = os.getenv("RUNPOD_API_BASE") 
-# 如果你在 RunPod 有設 API Key 就填，沒有就留空
-RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY", "EMPTY") 
-# 你在 RunPod 上跑的模型名稱 (要跟 RunPod 環境變數 MODEL_NAME 一樣)
-RUNPOD_MODEL_NAME = os.getenv("RUNPOD_MODEL_NAME", "google/gemma-2-9b-it")
+# 讀取你在 RunPod 啟動指令設定的密碼 (medgemma-secret-key)
+RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY", "medgemma-secret-key") 
+# 你的模型名稱 (必須跟 RunPod 啟動指令的一模一樣)
+RUNPOD_MODEL_NAME = os.getenv("RUNPOD_MODEL_NAME", "google/medgemma-27b-text-it")
 
 if channel_secret is None:
     print("Error: ChannelSecret not set.")
@@ -30,9 +30,9 @@ if channel_access_token is None:
     print("Error: ChannelAccessToken not set.")
     sys.exit(1)
 if RUNPOD_API_BASE is None:
-    print("Warning: RUNPOD_API_BASE not set. Bot will fail to reply.")
+    print("Warning: RUNPOD_API_BASE not set. Bot will not reply.")
 
-# ========== 初始化 ==========
+# ========== 2. 初始化 LINE Bot ==========
 
 app = FastAPI()
 session = aiohttp.ClientSession()
@@ -40,7 +40,7 @@ async_http_client = AiohttpAsyncHttpClient(session)
 line_bot_api = AsyncLineBotApi(channel_access_token, async_http_client)
 parser = WebhookParser(channel_secret)
 
-# ========== 知識庫 (RAG) ==========
+# ========== 3. 知識庫 (RAG 資料) ==========
 
 GENE_KB = [
     {
@@ -66,28 +66,45 @@ def build_context_from_kb(user_query: str) -> str:
         blocks.append(f"基因：{it['gene']}\n特徵：{it['condition']}\n風險：{it['risk']}\n建議：{it['advice']}")
     return "\n\n".join(blocks)
 
-# ========== 核心：呼叫 RunPod (OpenAI 格式) ==========
+# ========== 4. 呼叫 RunPod (vLLM OpenAI 格式) ==========
 
-async def call_runpod_medgemma(system_prompt: str, user_prompt: str) -> str:
-    """
-    連線到 RunPod vLLM (相容 OpenAI API 格式)
-    """
+async def call_runpod_medgemma(user_query: str) -> str:
     if not RUNPOD_API_BASE:
-        return "系統錯誤：未設定 RunPod 網址"
+        return "系統錯誤：Render 未設定 RunPod 網址"
 
-    # vLLM 的 Chat Completions 端點
-    url = f"{RUNPOD_API_BASE}/chat/completions"
-    
+    # 準備 Prompt (醫學+教練角色)
+    kb_context = build_context_from_kb(user_query)
+    system_prompt = f"""你是一位專業的運動醫學專家，同時也是一位親切的教練。
+請根據以下基因資料庫，回答使用者的問題。
+
+【基因資料庫】
+{kb_context}
+
+回答原則：
+1. 先從醫學角度分析生理機轉 (MedGemma 專長)。
+2. 再給出白話、具體的訓練建議 (教練口吻)。
+3. 請務必使用繁體中文。
+"""
+
+    # 組合正確的 API 網址
+    # 你的網址是 https://...runpod.net，vLLM 需要加上 /v1/chat/completions
+    # 這裡做個防呆，避免網址重複疊加
+    base_url = RUNPOD_API_BASE.rstrip("/")
+    if "/v1" not in base_url:
+        url = f"{base_url}/v1/chat/completions"
+    else:
+        url = f"{base_url}/chat/completions"
+
     headers = {
         "Authorization": f"Bearer {RUNPOD_API_KEY}",
         "Content-Type": "application/json"
     }
     
     payload = {
-        "model": RUNPOD_MODEL_NAME,
+        "model": RUNPOD_MODEL_NAME, # 例如: google/medgemma-27b-text-it
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": user_query}
         ],
         "max_tokens": 1024,
         "temperature": 0.7
@@ -95,49 +112,29 @@ async def call_runpod_medgemma(system_prompt: str, user_prompt: str) -> str:
 
     async with httpx.AsyncClient() as client:
         try:
-            # 設定 timeout 長一點，因為 RunPod 有時喚醒需要時間
+            # MedGemma 27B 思考需要時間，設定 120 秒超時
             resp = await client.post(url, json=payload, headers=headers, timeout=120.0)
             
+            # 錯誤處理
             if resp.status_code != 200:
-                return f"RunPod 錯誤 ({resp.status_code}): {resp.text}"
+                return f"RunPod 連線錯誤 (Code {resp.status_code}): {resp.text}"
             
+            # 解析回傳
             data = resp.json()
             return data["choices"][0]["message"]["content"].strip()
             
         except httpx.ConnectError:
-            return "無法連線到 RunPod，請確認 Pod 是否已啟動。"
+            return "無法連線到 RunPod，請確認 RunPod 伺服器是否開著？"
+        except httpx.ReadTimeout:
+            return "MedGemma 思考太久了 (Timeout)，請再試一次。"
         except Exception as e:
-            return f"連線發生例外: {str(e)}"
+            return f"發生未預期的錯誤: {str(e)}"
 
-# ========== 主流程 ==========
-
-async def process_message(user_query: str) -> str:
-    # 1. 準備 RAG 資料
-    kb_context = build_context_from_kb(user_query)
-    
-    # 2. 設定 Prompt (純文字模式，針對 MedGemma 優化)
-    system_prompt = f"""
-    你是一位專業的運動醫學專家，同時也是一位親切的教練。
-    請根據以下使用者的基因資料庫，回答使用者的問題。
-    
-    【基因資料庫】
-    {kb_context}
-    
-    回答原則：
-    1. 先從醫學角度分析生理機轉。
-    2. 再給出白話、具體的訓練建議。
-    3. 請使用繁體中文。
-    """
-    
-    # 3. 呼叫 RunPod
-    answer = await call_runpod_medgemma(system_prompt, user_query)
-    return answer
-
-# ========== Webhook ==========
+# ========== 5. Webhook 入口 ==========
 
 @app.get("/")
 async def root():
-    return {"message": "LineBot connected to RunPod is running!"}
+    return {"message": "MedLineBot is running and connected to RunPod!"}
 
 @app.post("/callback")
 async def handle_callback(request: Request):
@@ -154,10 +151,11 @@ async def handle_callback(request: Request):
         if isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
             user_text = event.message.text.strip()
             
-            # 傳送處理中訊息 (因為 RunPod 算比較久，防止使用者以為壞掉)
-            # (選擇性功能，這裡先直接回覆結果)
+            # 顯示「處理中」的暫時回應 (可選，避免 User 以為當機)
+            # await line_bot_api.push_message(event.source.user_id, TextSendMessage(text="MedGemma 正在思考中..."))
             
-            answer = await process_message(user_text)
+            # 呼叫 RunPod 取得答案
+            answer = await call_runpod_medgemma(user_text)
 
             await line_bot_api.reply_message(
                 event.reply_token,
